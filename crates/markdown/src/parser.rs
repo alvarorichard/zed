@@ -528,6 +528,10 @@ pub(crate) fn parse_markdown_with_options(
         }
     }
 
+    if parse_html {
+        fold_disclosure_blocks(text, &mut state.events, &mut html_blocks);
+    }
+
     let heading_slugs = if parse_heading_slugs {
         build_heading_slugs(text, &state.events)
     } else {
@@ -544,6 +548,108 @@ pub(crate) fn parse_markdown_with_options(
         heading_slugs,
         footnote_definitions,
     }
+}
+
+/// Splice synthetic `DisclosureStart` / `SummaryStart` / `SummaryEnd` / `DisclosureEnd`
+/// events into the event stream so the renderer can wrap inner markdown in a
+/// collapsible container. `pulldown_cmark` emits `<details>` and `</details>` as
+/// independent HTML blocks whenever a blank line separates them — which is the
+/// GFM convention — so pairing must happen post-parse, at the event level.
+fn fold_disclosure_blocks(
+    text: &str,
+    events: &mut Vec<(Range<usize>, MarkdownEvent)>,
+    html_blocks: &mut BTreeMap<usize, html::html_parser::ParsedHtmlBlock>,
+) {
+    use crate::disclosure::{DisclosureScan, scan_disclosure_tag};
+
+    let mut depth: Vec<()> = Vec::new();
+    let mut i = 0;
+    while i < events.len() {
+        let (range, event) = &events[i];
+        let MarkdownEvent::Start(MarkdownTag::HtmlBlock) = event else {
+            i += 1;
+            continue;
+        };
+        let range = range.clone();
+        let block_text = &text[range.clone()];
+        let Some(scan) = scan_disclosure_tag(block_text, range.clone()) else {
+            i += 1;
+            continue;
+        };
+
+        let Some(end_index) = find_html_block_end(events, i) else {
+            i += 1;
+            continue;
+        };
+
+        match scan {
+            DisclosureScan::Open {
+                open,
+                anchor,
+                summary_events,
+                self_closing,
+            } => {
+                html_blocks.remove(&range.start);
+                let mut replacement = Vec::with_capacity(3 + summary_events.len());
+                replacement.push((
+                    range.clone(),
+                    MarkdownEvent::DisclosureStart {
+                        open,
+                        anchor,
+                    },
+                ));
+                if !summary_events.is_empty() {
+                    replacement.push((range.clone(), MarkdownEvent::SummaryStart));
+                    replacement.extend(summary_events);
+                    replacement.push((range.clone(), MarkdownEvent::SummaryEnd));
+                }
+                let next = i + replacement.len();
+                let _ = events.splice(i..=end_index, replacement);
+                if self_closing {
+                    events.insert(next, (range, MarkdownEvent::DisclosureEnd));
+                    i = next + 1;
+                } else {
+                    depth.push(());
+                    i = next;
+                }
+            }
+            DisclosureScan::Close => {
+                if depth.pop().is_some() {
+                    html_blocks.remove(&range.start);
+                    let _ = events.splice(
+                        i..=end_index,
+                        std::iter::once((range, MarkdownEvent::DisclosureEnd)),
+                    );
+                    i += 1;
+                } else {
+                    // Stray closing tag — leave as ordinary HTML for graceful degradation.
+                    i = end_index + 1;
+                }
+            }
+        }
+    }
+
+    // Synthesize closers for any unmatched opens at end-of-document so the
+    // builder's div stack stays balanced.
+    for _ in depth.drain(..) {
+        let pos = text.len();
+        events.push((pos..pos, MarkdownEvent::DisclosureEnd));
+    }
+}
+
+fn find_html_block_end(
+    events: &[(Range<usize>, MarkdownEvent)],
+    start_index: usize,
+) -> Option<usize> {
+    for (offset, (_, event)) in events.iter().enumerate().skip(start_index + 1) {
+        if matches!(
+            event,
+            MarkdownEvent::End(pulldown_cmark::TagEnd::HtmlBlock)
+        ) {
+            return Some(offset);
+        }
+    }
+    None
 }
 
 fn build_footnote_definitions(
@@ -646,6 +752,23 @@ pub enum MarkdownEvent {
     RootStart,
     /// End of a root-level block. Contains the root block index.
     RootEnd(usize),
+    /// Start of an HTML `<details>` disclosure widget. Folded from raw HTML blocks
+    /// by `fold_disclosure_blocks` after `pulldown_cmark` parses the document.
+    DisclosureStart {
+        /// Reflects the `open` HTML attribute. Acts as the initial expand state
+        /// the first time the widget is rendered.
+        open: bool,
+        /// Stable identifier derived from the `<details>` open tag text. Used as
+        /// the toggle-state key on `Markdown::disclosure_state`.
+        anchor: SharedString,
+    },
+    /// Matching end of a `<details>` disclosure widget.
+    DisclosureEnd,
+    /// Start of the `<summary>` header inside a disclosure. Inline events follow
+    /// until the matching `SummaryEnd`.
+    SummaryStart,
+    /// Matching end of a `<summary>` header.
+    SummaryEnd,
 }
 
 /// Tags for elements that can contain other elements.
@@ -1345,5 +1468,90 @@ mod tests {
                 None,
             ]
         );
+    }
+
+    fn count_disclosures(events: &[(Range<usize>, MarkdownEvent)]) -> (usize, usize) {
+        let starts = events
+            .iter()
+            .filter(|(_, e)| matches!(e, DisclosureStart { .. }))
+            .count();
+        let ends = events
+            .iter()
+            .filter(|(_, e)| matches!(e, DisclosureEnd))
+            .count();
+        (starts, ends)
+    }
+
+    #[test]
+    fn fold_pairs_open_and_close_blocks() {
+        let src = "<details>\n<summary>Title</summary>\n\nBody text.\n\n</details>";
+        let parsed = parse_markdown_with_options(src, true, false);
+        let (starts, ends) = count_disclosures(&parsed.events);
+        assert_eq!(starts, 1);
+        assert_eq!(ends, 1);
+        // Body paragraph still present between the disclosure boundaries.
+        let body = parsed
+            .events
+            .iter()
+            .any(|(_, e)| matches!(e, Start(Paragraph)));
+        assert!(body, "paragraph between open/close should survive");
+    }
+
+    #[test]
+    fn fold_extracts_open_attribute() {
+        let src = "<details open>\n<summary>x</summary>\n\nbody\n\n</details>";
+        let parsed = parse_markdown_with_options(src, true, false);
+        let open = parsed
+            .events
+            .iter()
+            .find_map(|(_, e)| match e {
+                DisclosureStart { open, .. } => Some(*open),
+                _ => None,
+            })
+            .expect("disclosure event present");
+        assert!(open);
+    }
+
+    #[test]
+    fn fold_handles_nested_disclosures() {
+        let src = "<details>\n<summary>outer</summary>\n\n\
+                   <details>\n<summary>inner</summary>\n\nx\n\n</details>\n\n</details>";
+        let parsed = parse_markdown_with_options(src, true, false);
+        let (starts, ends) = count_disclosures(&parsed.events);
+        assert_eq!(starts, 2);
+        assert_eq!(ends, 2);
+    }
+
+    #[test]
+    fn fold_leaves_stray_close_untouched() {
+        let parsed = parse_markdown_with_options("body\n\n</details>", true, false);
+        let (starts, ends) = count_disclosures(&parsed.events);
+        assert_eq!(starts, 0);
+        assert_eq!(ends, 0);
+        // The orphan `</details>` block remains as an HtmlBlock event.
+        assert!(
+            parsed
+                .events
+                .iter()
+                .any(|(_, e)| matches!(e, Start(HtmlBlock)))
+        );
+    }
+
+    #[test]
+    fn fold_disabled_when_parse_html_off() {
+        let src = "<details>\n<summary>x</summary>\n\nbody\n\n</details>";
+        let parsed = parse_markdown_with_options(src, false, false);
+        let (starts, ends) = count_disclosures(&parsed.events);
+        assert_eq!(starts, 0);
+        assert_eq!(ends, 0);
+    }
+
+    #[test]
+    fn fold_synthesizes_close_at_eof_for_unmatched_open() {
+        let src = "<details>\n<summary>x</summary>\n\nbody only";
+        let parsed = parse_markdown_with_options(src, true, false);
+        let (starts, ends) = count_disclosures(&parsed.events);
+        assert_eq!(starts, 1);
+        assert_eq!(ends, 1, "unmatched open must be auto-closed at EOF");
     }
 }

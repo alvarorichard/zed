@@ -1,3 +1,4 @@
+pub mod disclosure;
 pub mod html;
 mod mermaid;
 pub mod parser;
@@ -339,6 +340,7 @@ pub struct Markdown {
     context_menu_selected_text: Option<String>,
     search_highlights: Vec<Range<usize>>,
     active_search_highlight: Option<usize>,
+    disclosure_state: crate::disclosure::DisclosureState,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -392,6 +394,15 @@ actions!(
         CopyAsMarkdown
     ]
 );
+
+struct DisclosureRenderFrame {
+    expanded: bool,
+    body_div_pushed: bool,
+    skipping_body: bool,
+    nested_skip_depth: u32,
+    anchor: SharedString,
+    default_open: bool,
+}
 
 enum EscapeAction {
     PassThrough,
@@ -512,9 +523,24 @@ impl Markdown {
             context_menu_selected_text: None,
             search_highlights: Vec::new(),
             active_search_highlight: None,
+            disclosure_state: crate::disclosure::DisclosureState::default(),
         };
         this.parse(cx);
         this
+    }
+
+    pub fn toggle_disclosure(
+        &mut self,
+        anchor: SharedString,
+        default_open: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.disclosure_state.toggle(anchor, default_open);
+        cx.notify();
+    }
+
+    pub fn disclosure_state(&self) -> &crate::disclosure::DisclosureState {
+        &self.disclosure_state
     }
 
     pub fn new_text(source: SharedString, cx: &mut Context<Self>) -> Self {
@@ -1677,7 +1703,14 @@ impl Element for MarkdownElement {
             self.style.base_text_style.clone(),
             self.style.syntax.clone(),
         );
-        let (parsed_markdown, images, active_root_block, render_mermaid_diagrams, mermaid_state) = {
+        let (
+            parsed_markdown,
+            images,
+            active_root_block,
+            render_mermaid_diagrams,
+            mermaid_state,
+            disclosure_state,
+        ) = {
             let markdown = self.markdown.read(cx);
             (
                 markdown.parsed_markdown.clone(),
@@ -1685,6 +1718,7 @@ impl Element for MarkdownElement {
                 markdown.active_root_block,
                 markdown.options.render_mermaid_diagrams,
                 markdown.mermaid_state.clone(),
+                markdown.disclosure_state.clone(),
             )
         };
         let markdown_end = if let Some(last) = parsed_markdown.events.last() {
@@ -1697,7 +1731,31 @@ impl Element for MarkdownElement {
         let mut current_img_block_range: Option<Range<usize>> = None;
         let mut handled_html_block = false;
         let mut rendered_mermaid_block = false;
+        let mut disclosure_frames: Vec<DisclosureRenderFrame> = Vec::new();
+        let markdown_entity = self.markdown.downgrade();
         for (index, (range, event)) in parsed_markdown.events.iter().enumerate() {
+            // Disclosure body skipping: collapsed `<details>` swallows every event
+            // until the matching `DisclosureEnd`. Nested disclosures inside a
+            // collapsed scope bump `nested_skip_depth` on the top frame so the
+            // skip range stays balanced without touching the builder's div stack.
+            if let Some(top) = disclosure_frames.last_mut()
+                && top.skipping_body
+            {
+                match event {
+                    MarkdownEvent::DisclosureStart { .. } => {
+                        top.nested_skip_depth += 1;
+                        continue;
+                    }
+                    MarkdownEvent::DisclosureEnd => {
+                        if top.nested_skip_depth > 0 {
+                            top.nested_skip_depth -= 1;
+                            continue;
+                        }
+                        // fall through to the real DisclosureEnd handler below
+                    }
+                    _ => continue,
+                }
+            }
             // Skip alt text for images that rendered
             if let Some(current_img_block_range) = &current_img_block_range
                 && current_img_block_range.end > range.end
@@ -2274,6 +2332,113 @@ impl Element for MarkdownElement {
                     builder.push_text_style(self.style.link.clone());
                     builder.push_text(&format!("[{label}]"), range.clone());
                     builder.pop_text_style();
+                }
+                MarkdownEvent::DisclosureStart { open, anchor } => {
+                    let expanded = disclosure_state.is_expanded(anchor, *open);
+                    builder.push_div(
+                        div()
+                            .id(("md-details", range.start))
+                            .flex()
+                            .flex_col()
+                            .my_2()
+                            .border_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .rounded_md()
+                            .overflow_hidden(),
+                        range,
+                        markdown_end,
+                    );
+                    let has_summary = matches!(
+                        parsed_markdown.events.get(index + 1),
+                        Some((_, MarkdownEvent::SummaryStart))
+                    );
+                    let mut frame = DisclosureRenderFrame {
+                        expanded,
+                        body_div_pushed: false,
+                        skipping_body: false,
+                        nested_skip_depth: 0,
+                        anchor: anchor.clone(),
+                        default_open: *open,
+                    };
+                    if !has_summary {
+                        if expanded {
+                            builder.push_div(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .bg(cx.theme().colors().editor_background),
+                                range,
+                                markdown_end,
+                            );
+                            frame.body_div_pushed = true;
+                        } else {
+                            frame.skipping_body = true;
+                        }
+                    }
+                    disclosure_frames.push(frame);
+                }
+                MarkdownEvent::SummaryStart => {
+                    let Some(frame) = disclosure_frames.last() else {
+                        continue;
+                    };
+                    let anchor = frame.anchor.clone();
+                    let default_open = frame.default_open;
+                    let expanded = frame.expanded;
+                    let entity = markdown_entity.clone();
+                    let chevron = if expanded {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    };
+                    let header = h_flex()
+                        .id(("md-summary", range.start))
+                        .gap_1p5()
+                        .px_2()
+                        .py_1p5()
+                        .cursor_pointer()
+                        .bg(cx.theme().colors().element_background)
+                        .hover(|s| s.bg(cx.theme().colors().element_hover))
+                        .child(
+                            Icon::new(chevron)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .on_click(move |_, _, cx| {
+                            entity
+                                .update(cx, |md, cx| {
+                                    md.toggle_disclosure(anchor.clone(), default_open, cx);
+                                })
+                                .ok();
+                        });
+                    builder.push_div(header, range, markdown_end);
+                }
+                MarkdownEvent::SummaryEnd => {
+                    builder.pop_div();
+                    let Some(frame) = disclosure_frames.last_mut() else {
+                        continue;
+                    };
+                    if frame.expanded {
+                        builder.push_div(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .bg(cx.theme().colors().editor_background),
+                            range,
+                            markdown_end,
+                        );
+                        frame.body_div_pushed = true;
+                    } else {
+                        frame.skipping_body = true;
+                    }
+                }
+                MarkdownEvent::DisclosureEnd => {
+                    let Some(frame) = disclosure_frames.pop() else {
+                        continue;
+                    };
+                    if frame.body_div_pushed {
+                        builder.pop_div();
+                    }
+                    builder.pop_div();
                 }
             }
         }
